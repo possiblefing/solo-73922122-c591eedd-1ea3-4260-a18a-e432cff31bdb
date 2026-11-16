@@ -1,0 +1,16 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Local data volume (never commit batch data or the SQLite WAL)
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store

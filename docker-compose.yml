@@ -1,0 +1,43 @@
+# Two API replicas sharing one named data volume.
+# SQLite in WAL mode tolerates multi-process access; every mutating
+# endpoint takes a short BEGIN IMMEDIATE lock, and downloads hold no
+# database lock while streaming.
+services:
+  archive-api-a:
+    build: .
+    image: archive-reclamation:latest
+    environment:
+      ARCHIVE_DATA_DIR: /data
+      INSTANCE_NAME: api-a
+    ports:
+      - "8001:8000"
+    volumes:
+      - archive-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    stop_grace_period: 30s
+
+  archive-api-b:
+    image: archive-reclamation:latest
+    build: .
+    environment:
+      ARCHIVE_DATA_DIR: /data
+      INSTANCE_NAME: api-b
+    ports:
+      - "8002:8000"
+    volumes:
+      - archive-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    stop_grace_period: 30s
+
+volumes:
+  archive-data:

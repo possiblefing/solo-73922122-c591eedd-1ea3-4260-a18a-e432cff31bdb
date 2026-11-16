@@ -1,43 +1,56 @@
 # Two API replicas sharing one named data volume.
+#
+#   docker compose up --build
+#   instance A: http://localhost:8001/docs   (upload/download/retire/query)
+#   instance B: http://localhost:8002/docs
+#
 # SQLite in WAL mode tolerates multi-process access; every mutating
-# endpoint takes a short BEGIN IMMEDIATE lock, and downloads hold no
-# database lock while streaming.
+# endpoint takes a short BEGIN IMMEDIATE lock, and downloads pin an open
+# file descriptor before sending headers, so reclamation on either
+# replica can never truncate an in-flight transfer.
+#
+# The image is built once (service A owns the `build:` stanza) and reused
+# by service B, so `up --build` cannot race two builds onto the same tag.
+# B never pulls: it must use exactly the image A just built.
+x-app: &app
+  image: archive-reclamation:latest
+  pull_policy: never
+  environment:
+    ARCHIVE_DATA_DIR: /data
+  volumes:
+    - archive-data:/data
+  restart: unless-stopped
+  stop_grace_period: 30s
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
 services:
   archive-api-a:
+    <<: *app
     build: .
-    image: archive-reclamation:latest
     environment:
       ARCHIVE_DATA_DIR: /data
       INSTANCE_NAME: api-a
     ports:
       - "8001:8000"
-    volumes:
-      - archive-data:/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-    stop_grace_period: 30s
 
   archive-api-b:
-    image: archive-reclamation:latest
-    build: .
+    <<: *app
     environment:
       ARCHIVE_DATA_DIR: /data
       INSTANCE_NAME: api-b
     ports:
       - "8002:8000"
-    volumes:
-      - archive-data:/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-    stop_grace_period: 30s
+    depends_on:
+      archive-api-a:
+        condition: service_started
 
 volumes:
   archive-data:

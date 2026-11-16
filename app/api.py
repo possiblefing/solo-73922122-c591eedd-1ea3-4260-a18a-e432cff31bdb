@@ -13,14 +13,15 @@ download always finishes and never blocks another batch's retirement.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from pathlib import Path
+import os
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from . import config, db, storage
+from .download import ArchiveDownloadResponse
 
 
 # --------------------------------------------------------------------------- #
@@ -42,6 +43,9 @@ class BatchListResponse(BaseModel):
 
 
 class StorageSummary(BaseModel):
+    # Which replica served this view (INSTANCE_NAME in docker-compose);
+    # useful to confirm both instances see the same shared volume.
+    instance: str
     active_batches: int
     retired_batches: int
     # Rows in the blobs table - the number of originals that must exist.
@@ -83,11 +87,16 @@ async def lifespan(app: FastAPI) -> Any:
 
 app = FastAPI(
     title="Sequencing Center Archive Reclamation API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Upload per-batch ZIP archives (deduplicated by SHA-256), "
         "download original bytes, retire batches and garbage-collect "
-        "originals that no batch references anymore."
+        "originals that no batch references anymore.\n\n"
+        "Downloads pin the original's file descriptor before the 200 "
+        "status is sent, so retiring a batch (here or on a sibling "
+        "instance sharing the volume) never truncates a transfer that "
+        "already started. Retired batch numbers return 404 and can never "
+        "be reused."
     ),
     lifespan=lifespan,
 )
@@ -219,12 +228,22 @@ def upload_archive(batch_id: str, file: UploadFile = File(...)) -> UploadRespons
 
 
 @app.get("/batches/{batch_id}/archive")
-def download_archive(batch_id: str) -> FileResponse:
+def download_archive(batch_id: str) -> Response:
     """Download the original uploaded bytes for an active batch.
 
-    Returns 404 for unknown or retired batches (retired numbers stay
-    dead).  Once the response starts, it streams from an open file
-    descriptor, so concurrent garbage collection cannot interrupt it.
+    ``206`` with single/suffix/open-ended/multiple ``Range`` and
+    ``If-Range`` is supported; the body always matches the advertised
+    ``Content-Length``/``Content-Range``.
+
+    404 for unknown or retired batches (retired numbers stay dead).  The
+    file descriptor is opened *before* the response headers are sent:
+    once the client sees ``200``, its bytes are pinned on this instance
+    and concurrent reclamation (here or on a sibling instance sharing the
+    volume) can no longer truncate the transfer.  A slow transfer holds
+    no database lock and no lock in ``blobs/``, so it never delays
+    another batch's retirement or GC.  If the client disconnects, the
+    descriptor is closed promptly, releasing any original that was
+    reclaimed in the meantime.
     """
     _validate_batch_id(batch_id)
     conn = db.get_conn()
@@ -238,22 +257,38 @@ def download_archive(batch_id: str) -> FileResponse:
             detail=f"no active batch '{batch_id}'",
         )
 
-    path = Path(config.BLOB_DIR) / batch["sha256"]
-    if not path.exists():
+    try:
+        fd, stat_result = storage.open_original(batch["sha256"])
+    except storage.OriginalUnavailable:
         # Transient crash-recovery window: the row is live but bytes are
-        # being restored.  Report missing rather than stream a broken file.
+        # being restored, or the batch was retired a moment ago and GC
+        # won the race for the directory entry.  Either way there is no
+        # body to promise, so report missing while headers are still ours
+        # to choose - never start a 200 and then fail.
         raise HTTPException(
             status_code=404,
             detail=f"original for batch '{batch_id}' is currently unavailable",
+        ) from None
+
+    if stat_result.st_size != batch["size_bytes"]:
+        # The ledger and the inode disagree; do not promise a length we
+        # cannot honour.
+        os.close(fd)
+        raise HTTPException(
+            status_code=404,
+            detail=f"original for batch '{batch_id}' is inconsistent",
         )
 
-    # FileResponse opens the descriptor now and keeps it for the whole
-    # (possibly slow) transfer.  No DB transaction is held meanwhile.
-    return FileResponse(
-        path,
-        media_type="application/zip",
-        filename=f"{batch_id}.zip",
-    )
+    # Descriptor ownership moves to the response; it always closes it.
+    try:
+        return ArchiveDownloadResponse(
+            fd,
+            stat_result,
+            filename=f"{batch_id}.zip",
+        )
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 @app.post("/batches/{batch_id}/retire", status_code=200)
@@ -355,6 +390,7 @@ def storage_summary() -> StorageSummary:
     blob_files = [p for p in config.BLOB_DIR.iterdir() if p.is_file()]
     quarantined = [p for p in config.QUARANTINE_DIR.iterdir() if p.is_file()]
     return StorageSummary(
+        instance=os.environ.get("INSTANCE_NAME", "local"),
         active_batches=active,
         retired_batches=retired,
         blob_rows=blob_rows,

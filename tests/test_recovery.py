@@ -168,6 +168,148 @@ def test_upload_reclaims_blob_stuck_in_deleting(data_dir):
         assert c.get("/batches/NEW/archive").content == body
 
 
+def test_missing_file_row_is_removed_not_reinserted(data_dir):
+    """A ready row whose bytes are gone must be deleted, not resurrected.
+
+    Regression: phase two used to re-insert a ``ready`` row for the same
+    hash whenever it saw its own ``ready`` row, so an orphan row with no
+    bytes survived every GC pass forever (``blob_rows`` never converged
+    to ``blob_files_on_disk``).
+    """
+    from app import storage
+
+    digest = hashlib.sha256(b"orphan-row").hexdigest()
+
+    with TestClient(app) as c:
+        pass                     # schema + empty-store reconcile
+
+        # A ready row with no batch reference and no bytes anywhere.
+        conn = sqlite3.connect(data_dir / "archives.db")
+        conn.execute(
+            "INSERT INTO blobs (sha256, size_bytes, status) "
+            "VALUES (?, 999, 'ready')",
+            (digest,),
+        )
+        conn.commit()
+        conn.close()
+
+        # Repeated GC runs must converge and stay converged.
+        for _ in range(3):
+            storage.run_gc()
+            summary = c.get("/storage/summary").json()
+            assert summary["blob_rows"] == 0
+            assert summary["blob_files_on_disk"] == 0
+            assert summary["queued_for_gc"] == 0
+
+
+def test_mark_holds_write_lock_across_orphan_reaper(data_dir, monkeypatch):
+    """The ledger read and orphan reaping must share one write lock.
+
+    Regression: ``_mark`` read the blob ledger, then listed ``blobs/``
+    with no lock in between.  An upload committing and publishing a new
+    original in that window made the fresh file look rowless, so the
+    reaper deleted an active batch's bytes.
+
+    Observable invariant: while the reaper runs, no other process can
+    take the write lock, so no upload can commit a row after the ledger
+    was read.  (The upload publishes only after committing.)
+    """
+    import threading
+
+    from app import config, storage
+
+    with TestClient(app):
+        pass                     # schema + empty-store reconcile
+
+    observed: dict[str, bool] = {}
+    real_iterdir = type(config.BLOB_DIR).iterdir
+
+    def iterdir_with_concurrent_writer(self):
+        def try_write() -> None:
+            conn = sqlite3.connect(data_dir / "archives.db", timeout=0.2)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("COMMIT")
+                observed["acquired"] = True
+            except sqlite3.OperationalError:
+                observed["acquired"] = False
+            finally:
+                conn.close()
+
+        thread = threading.Thread(target=try_write)
+        thread.start()
+        thread.join(timeout=5)
+        return real_iterdir(self)
+
+    monkeypatch.setattr(
+        type(config.BLOB_DIR), "iterdir", iterdir_with_concurrent_writer
+    )
+    storage._mark(storage.GcReport())
+
+    assert observed.get("acquired") is False
+
+
+def test_sweep_does_not_strand_active_batch_when_upload_claims_blob(
+    data_dir, monkeypatch
+):
+    """Upload/GC interleaving must never leave an active batch without bytes.
+
+    Deterministic version of the failure the race hammer found: the sweep
+    marks a blob ``deleting``, an upload claims the same hash for a new
+    batch (flipping it back to ``ready`` + publishing), and the sweep must
+    not then move that original into quarantine and delete it.
+    """
+    from app import db, storage
+
+    body = make_zip({"interleave": b"upload-claims-while-sweeping"})
+    digest = hashlib.sha256(body).hexdigest()
+
+    with TestClient(app) as c:
+        assert upload(c, "DOOMED", body).status_code == 200
+        # Retire via SQL so GC has not run yet (the queue is filled below).
+        conn = sqlite3.connect(data_dir / "archives.db")
+        conn.execute(
+            "UPDATE batches SET status='retired' WHERE batch_id='DOOMED'"
+        )
+        conn.commit()
+        conn.close()
+
+        # Mark and produce the exact post-phase-one state without removing
+        # the bytes yet, so the upload can claim the hash in between.
+        storage._mark(storage.GcReport())
+        with db.transaction() as conn:
+            conn.execute(
+                "UPDATE blobs SET status='deleting', quarantine_path=? "
+                "WHERE sha256=?",
+                (str(data_dir / "quarantine" / digest), digest),
+            )
+
+        # A new active batch claims the same content (what upload_archive
+        # does in its transaction: deleting -> ready, publish bytes).
+        with db.transaction() as conn:
+            conn.execute(
+                "UPDATE blobs SET status='ready', quarantine_path=NULL "
+                "WHERE sha256=?", (digest,),
+            )
+            conn.execute("DELETE FROM gc_queue WHERE sha256=?", (digest,))
+            conn.execute(
+                "INSERT INTO batches (batch_id, sha256, size_bytes, status) "
+                "VALUES ('NEW', ?, ?, 'active')",
+                (digest, len(body)),
+            )
+
+        # A full GC pass now must keep the bytes downloadable.
+        storage.run_gc()
+        assert (data_dir / "blobs" / digest).exists()
+        assert not (data_dir / "quarantine" / digest).exists()
+        got = c.get("/batches/NEW/archive")
+        assert got.status_code == 200
+        assert hashlib.sha256(got.content).hexdigest() == digest
+        summary = c.get("/storage/summary").json()
+        assert summary["blob_rows"] == summary["blob_files_on_disk"] == 1
+        assert summary["queued_for_gc"] == 0
+
+
 def test_orphan_tmp_parts_are_reaped_on_restart(data_dir):
     body = make_zip({"z": b"abc"})
     with TestClient(app) as c:

@@ -11,13 +11,21 @@ instances and across crashes:
 
 * **mark** - every blob with no active batch reference is recorded in
   ``gc_queue``; files on disk that no blob row knows about are reaped.
+  The ledger read, the directory listing and the unlinks all happen under
+  the write lock, so a file published by a racing upload can never be
+  mistaken for junk.
 * **sweep** - each queued blob is re-checked.  If it has gained a
   reference again (a new upload reused the hash) it is kept/restored.
-  Otherwise the row is flipped to ``deleting``, the bytes move to
-  quarantine and the blob row is deleted inside a second transaction;
-  the quarantined file is unlinked afterwards.  A crash between steps
-  leaves a ``deleting`` row or a quarantine file that
+  Otherwise the row is flipped to ``deleting`` (guarded on ``ready`` and
+  on the absence of a live reference), the bytes move to quarantine, and
+  a final write-locked transaction re-checks references, deletes the row
+  and unlinks both copies atomically with respect to uploads.  A crash
+  between steps leaves a ``deleting`` row or a quarantine file that
   :func:`reconcile` resumes on restart.
+
+Downloads (:func:`open_original`) pin the inode before any response
+header is committed, so reclamation on either instance cannot truncate an
+in-flight transfer.
 
 Upload ordering (also crash-safe):
 
@@ -27,13 +35,16 @@ Upload ordering (also crash-safe):
 
 The row always exists before the file appears, so the mark reaper can
 never mistake a fresh upload for an orphan, and every upload guarantees
-the physical bytes for the row it claims.
+the physical bytes for the row it claims.  GC's delete decisions are
+taken while holding the same write lock, so they can never race that
+ordering.
 """
 from __future__ import annotations
 
 import hashlib
 import io
 import os
+import stat
 import uuid
 import zipfile
 from dataclasses import dataclass, field
@@ -121,6 +132,53 @@ def publish(tmp: Path, sha256: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Pinned reads (download safety)
+# --------------------------------------------------------------------------- #
+
+class OriginalUnavailable(Exception):
+    """The original is not readable right now (retired, GC'd, restoring)."""
+
+
+def open_original(sha256: str) -> tuple[int, os.stat_result]:
+    """Open the original's bytes and pin the inode with an OS descriptor.
+
+    The returned descriptor is opened *before* any HTTP response header is
+    committed.  Once open, a concurrent rename into ``quarantine/`` or an
+    unlink by either instance cannot affect the readable inode (POSIX), so
+    the download can always deliver exactly the bytes its headers promise.
+
+    If the directory entry in ``blobs/`` is momentarily gone because GC
+    moved the bytes to ``quarantine/`` while a live reference was being
+    re-established, the quarantined copy (same content-addressed inode) is
+    used instead.  Once the descriptor is open, both paths may vanish.
+
+    The file must be a regular file.  Anything else is reported as
+    :class:`OriginalUnavailable` rather than streaming something the
+    client did not ask for.  The caller owns the descriptor and must
+    close it.
+    """
+    last_error: OSError | None = None
+    for path in (blob_path(sha256), quarantine_path(sha256)):
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        except FileNotFoundError as exc:
+            last_error = exc
+            continue
+        except NotADirectoryError as exc:
+            last_error = exc
+            continue
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OriginalUnavailable(sha256)
+            return fd, st
+        except BaseException:
+            os.close(fd)
+            raise
+    raise OriginalUnavailable(sha256) from last_error
+
+
+# --------------------------------------------------------------------------- #
 # Garbage collection
 # --------------------------------------------------------------------------- #
 
@@ -149,14 +207,24 @@ def move_back_from_quarantine(sha256: str) -> None:
 def _mark(report: GcReport) -> None:
     conn = db.get_conn()
 
-    # Reap physical files that no blob row accounts for.  With the upload
-    # ordering (row committed before the rename) these can only be crash
-    # leftovers from older releases or manually placed junk.
-    known = {row["sha256"] for row in conn.execute("SELECT sha256 FROM blobs")}
-    on_disk = {p.name for p in config.BLOB_DIR.iterdir() if p.is_file()}
-    for name in sorted(on_disk - known):
-        (config.BLOB_DIR / name).unlink(missing_ok=True)
-        report.reaped_unknown_files.append(name)
+    # Reap physical files that no blob row accounts for.  Run the re-check
+    # and the unlink under the write lock: uploads commit their row before
+    # publishing bytes, so with the lock held a file that some row names
+    # can never be mistaken for junk (and an upload that has not committed
+    # yet cannot rename a file into blobs/ until we release).  Without
+    # this, a read of the ledger followed by a directory listing could
+    # delete a freshly published original of an active batch.
+    with db.transaction():
+        known = {
+            row["sha256"] for row in conn.execute("SELECT sha256 FROM blobs")
+        }
+        on_disk = {p.name for p in config.BLOB_DIR.iterdir() if p.is_file()}
+        for name in sorted(on_disk - known):
+            try:
+                (config.BLOB_DIR / name).unlink()
+            except FileNotFoundError:
+                pass
+            report.reaped_unknown_files.append(name)
 
     # Queue every ready blob without an active batch reference.
     rows = conn.execute(
@@ -204,30 +272,14 @@ def _finish_phase_two(sha256: str, report: GcReport) -> None:
             conn.execute("DELETE FROM gc_queue WHERE sha256 = ?", (sha256,))
             restored = True
         else:
-            live_ready = conn.execute(
-                "SELECT 1 FROM blobs WHERE sha256 = ? AND status = 'ready' "
-                "LIMIT 1",
-                (sha256,),
-            ).fetchone()
+            # No live reference: drop the row.  Do NOT re-insert it.  A
+            # racing upload cannot hold a row here (we hold the write
+            # lock); it can only commit *after* this transaction, and its
+            # own publish step materializes the bytes.  Re-inserting a
+            # row for a missing file used to strand a "ready" row with no
+            # bytes that every later sweep re-inserted forever.
             conn.execute("DELETE FROM blobs WHERE sha256 = ?", (sha256,))
             conn.execute("DELETE FROM gc_queue WHERE sha256 = ?", (sha256,))
-            if live_ready:
-                # An upload racing us already committed a replacement row.
-                # Re-insert it so the table still names the bytes; the
-                # upload's publish/move_back step will materialize them.
-                size_row = conn.execute(
-                    "SELECT size_bytes FROM batches WHERE sha256 = ? "
-                    "LIMIT 1",
-                    (sha256,),
-                ).fetchone()
-                size_bytes = size_row["size_bytes"] if size_row else (
-                    q.stat().st_size if q.exists() else 0
-                )
-                conn.execute(
-                    "INSERT INTO blobs (sha256, size_bytes, status) "
-                    "VALUES (?, ?, 'ready')",
-                    (sha256, size_bytes),
-                )
             restored = False
 
     if restored:
@@ -235,26 +287,32 @@ def _finish_phase_two(sha256: str, report: GcReport) -> None:
         report.restored_blobs.append(sha256)
         return
 
+    # Decide and unlink under the write lock.  An upload commits its blob
+    # row *before* it renames bytes into blobs/, so while we hold the lock
+    # no new row can appear, and any publish that happens now belongs to a
+    # row we can see.  That makes "is there a live row?" + "delete the
+    # leftovers" atomic against uploads: an original that a live row names
+    # is never unlinked.
     qpath = quarantine_path(sha256)
-    if live_ready:
-        # Keep the quarantined bytes: the racing upload moves them back
-        # (or republishes identical bytes from its own staged part).
-        if blob_path(sha256).exists():
-            qpath.unlink(missing_ok=True)
-        # The old 'deleting' row was replaced by a live 'ready' row.
-        report.restored_blobs.append(sha256)
-        return
-    qpath.unlink(missing_ok=True)
-
-    # A same-hash upload committing after our row delete recreates the row
-    # before publishing the file.  Only remove an orphan without a live row.
-    bpath = blob_path(sha256)
-    if bpath.exists():
+    with db.transaction():
         live = conn.execute(
             "SELECT 1 FROM blobs WHERE sha256 = ?", (sha256,)
         ).fetchone()
-        if live is None:
-            bpath.unlink(missing_ok=True)
+        if live is not None:
+            # A same-hash upload committed a replacement row (and may have
+            # published its own bytes).  Keep exactly one copy and let the
+            # upload's publish/move_back step own the final layout.
+            if blob_path(sha256).exists():
+                qpath.unlink(missing_ok=True)
+            else:
+                move_back_from_quarantine(sha256)
+            report.restored_blobs.append(sha256)
+            return
+
+        # No row references these bytes: reclaim both copies.
+        qpath.unlink(missing_ok=True)
+        blob_path(sha256).unlink(missing_ok=True)
+
     _fsync_dir(config.QUARANTINE_DIR)
     report.deleted_blobs.append(sha256)
 
@@ -299,13 +357,30 @@ def _sweep_one(sha256: str, report: GcReport) -> None:
         report.swept_queued += 1
         return
 
-    # Phase one: flip the row to 'deleting', then move bytes to quarantine.
+    # Phase one: flip the row to 'deleting' under the write lock, but only
+    # if the row really is still ''ready'' and still unreferenced.  If a
+    # same-hash upload claimed it in the meantime (re-upload sets it back
+    # to ''ready'' after a sweep marked it), the guarded UPDATE changes no
+    # rows; re-evaluate instead of moving bytes a live batch still needs.
     with db.transaction():
-        conn.execute(
+        still_unreferenced = conn.execute(
+            "SELECT 1 FROM batches WHERE sha256 = ? AND status = 'active' "
+            "LIMIT 1",
+            (sha256,),
+        ).fetchone() is None
+        if not still_unreferenced:
+            conn.execute("DELETE FROM gc_queue WHERE sha256 = ?", (sha256,))
+            report.restored_blobs.append(sha256)
+            return
+        updated = conn.execute(
             "UPDATE blobs SET status = 'deleting', quarantine_path = ? "
             "WHERE sha256 = ? AND status = 'ready'",
             (str(quarantine_path(sha256)), sha256),
-        )
+        ).rowcount
+    if not updated:
+        # Someone else (another instance, or an upload) changed the row.
+        _sweep_one(sha256, report)
+        return
     if CRASH_HOOK == "phase1":
         os._exit(2)
     qpath = quarantine_path(sha256)
